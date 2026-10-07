@@ -26,7 +26,7 @@ pipeline {
 
     environment {
         azureRepoUrl          = "https://dev.azure.com/MaybankDigitalTeam/VP%20Listener/_git/VP%20Listener"
-        azureDevopsCredential = "azure-devops-pat"
+        azureDevopsCredential = "vp-listener-git"
 
         repo            = "repouat.maybank.co.id:8082"
         serviceName     = "vp-fms-interceptor"
