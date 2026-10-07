@@ -20,6 +20,4 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
 
 {{- define "vp-fms-interceptor.selectorLabels" -}}
 app: {{ include "vp-fms-interceptor.fullname" . }}
-app.kubernetes.io/name: {{ include "vp-fms-interceptor.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
