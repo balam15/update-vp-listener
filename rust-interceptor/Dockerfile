@@ -18,6 +18,7 @@ RUN apk add --no-cache \
     openssl-libs-static \
     curl-dev \
     zlib-dev \
+    zlib-static \
     build-base \
     cmake
 
