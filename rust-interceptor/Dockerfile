@@ -1,7 +1,37 @@
+FROM repo.maybank.co.id/docker-proxy/rust:1.97-alpine AS build
+
+WORKDIR /src
+
+ARG EXTRA_CA_CERT=config.toml
+COPY ${EXTRA_CA_CERT} /tmp/extra-ca-cert
+
+RUN if grep -q "BEGIN CERTIFICATE" /tmp/extra-ca-cert; then \
+        cat /tmp/extra-ca-cert >> /etc/ssl/certs/ca-certificates.crt; \
+    fi; \
+    rm -f /tmp/extra-ca-cert
+
+RUN apk add --no-cache \
+    ca-certificates \
+    musl-dev \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static \
+    curl-dev \
+    zlib-dev \
+    build-base
+
+COPY rust-interceptor/Cargo.toml rust-interceptor/Cargo.lock ./
+COPY rust-interceptor/src ./src
+
+RUN cargo build --release --locked \
+    && strip target/release/vp-fms-interceptor
+
+
 FROM repo.maybank.co.id/docker-proxy/alpine:3.21
 
 ARG EXTRA_CA_CERT=config.toml
 COPY ${EXTRA_CA_CERT} /tmp/extra-ca-cert
+
 RUN if grep -q "BEGIN CERTIFICATE" /tmp/extra-ca-cert; then \
         cat /tmp/extra-ca-cert >> /etc/ssl/certs/ca-certificates.crt; \
     fi; \
