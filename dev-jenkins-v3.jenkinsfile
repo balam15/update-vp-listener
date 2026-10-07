@@ -1,0 +1,479 @@
+pipeline {
+    agent {
+        label 'docker-agent'
+    }
+
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'branchName', defaultValue: 'master', description: 'Input Azure DevOps branch name, e.g. master')
+        string(name: 'imageTag', defaultValue: 'rust-1.0.0', description: 'Input Image Tag, e.g. rust-1.0.0')
+        string(name: 'replicaCount', defaultValue: '1', description: 'Input Replica Count')
+
+        string(
+            name: 'namespace',
+            defaultValue: 'vynamic-uat-1',
+            description: 'Target OpenShift namespace. Jenkins credential kubeconfig must be <namespace>.kubeconfig'
+        )
+
+        choice(name: 'buildFlag', choices: ['false', 'true'], description: 'Flag for Build Container Image')
+        choice(name: 'pushFlag', choices: ['false', 'true'], description: 'Flag for Push Image to Nexus Registry')
+        choice(name: 'deployFlag', choices: ['false', 'true'], description: 'Flag for Deploy to OpenShift using Helm')
+    }
+
+    environment {
+        azureRepoUrl          = "https://dev.azure.com/MaybankDigitalTeam/VP%20Listener/_git/VP%20Listener"
+        azureDevopsCredential = "azure-devops-pat"
+
+        repo            = "repouat.maybank.co.id:8082"
+        serviceName     = "vp-fms-interceptor"
+        imageRepository = "repouat.maybank.co.id:8082/vp-fms-interceptor"
+
+        dockerFile      = "rust-interceptor/Dockerfile"
+        zscalerCert     = "zscaler-ca.cer"
+
+        helmChartDir    = "helm"
+        helmValuesFile  = "values-uat.yaml"
+
+        remoteHost      = "10.186.0.10"
+        sshCredentials  = "ssh-root"
+
+        logPvcName      = "vp-fms-interceptor-log-pvc"
+        logMountPath    = "/var/log/vp-fms-interceptor"
+        storageClass    = "netapp-files-dynamic"
+        pvcSize         = "5Gi"
+
+        proxyUrl        = "http://proxyzs.maybank.co.id:9443/"
+        noProxyList     = ".maybank.co.id,.maylab.net,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,172.21.0.0/24,10.230.0.0/16,10.166.0.0/16,10.186.0.0/16,localhost,127.0.0.1"
+    }
+
+    stages {
+        stage('Confirm Execution') {
+            steps {
+                script {
+                    def targetNamespace = params.namespace.trim()
+                    def targetKubeconfigId = "${targetNamespace}.kubeconfig"
+                    def targetServiceAccount = "${targetNamespace}-sa"
+
+                    def confirmMessage = """
+Please confirm this execution.
+
+Git Repository   : ${env.azureRepoUrl}
+Branch           : ${params.branchName}
+
+Image Tag        : ${params.imageTag}
+Replica Count    : ${params.replicaCount}
+
+Build Image      : ${params.buildFlag}
+Push Image       : ${params.pushFlag}
+Deploy to OCP    : ${params.deployFlag}
+
+Namespace        : ${targetNamespace}
+Kubeconfig ID    : ${targetKubeconfigId}
+ServiceAccount   : ${targetServiceAccount}
+
+Image Repository : ${env.imageRepository}:${params.imageTag}
+Helm Chart       : ${env.helmChartDir}
+Values File      : ${env.helmValuesFile}
+"""
+                    input message: confirmMessage, ok: 'Continue'
+                }
+            }
+        }
+
+        stage('Checkout Source Code from Azure DevOps') {
+            steps {
+                deleteDir()
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${params.branchName}"]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [
+                        [$class: 'CleanBeforeCheckout']
+                    ],
+                    userRemoteConfigs: [[
+                        url: "${env.azureRepoUrl}",
+                        credentialsId: "${env.azureDevopsCredential}"
+                    ]]
+                ])
+
+                sh """
+                    set -e
+
+                    echo "Current Repository:"
+                    git remote -v
+
+                    echo ""
+                    echo "Current Branch:"
+                    git branch -a
+
+                    echo ""
+                    echo "Latest Commit:"
+                    git log -1 --oneline
+
+                    echo ""
+                    echo "Repository root files:"
+                    ls -lah
+                """
+            }
+        }
+
+        stage('Validate Helm Chart Files') {
+            steps {
+                sh """
+                    set -e
+
+                    echo "Validate Helm chart structure ..."
+                    echo "Helm chart dir: ${helmChartDir}"
+
+                    test -d ${helmChartDir}
+                    test -f ${helmChartDir}/Chart.yaml
+                    test -f ${helmChartDir}/values.yaml
+                    test -f ${helmChartDir}/${helmValuesFile}
+
+                    test -f ${helmChartDir}/templates/_helpers.tpl
+                    test -f ${helmChartDir}/templates/configmap.yaml
+                    test -f ${helmChartDir}/templates/pvc.yaml
+                    test -f ${helmChartDir}/templates/deployment.yaml
+                    test -f ${helmChartDir}/templates/service.yaml
+
+                    echo ""
+                    echo "Helm chart files are complete."
+                """
+            }
+        }
+
+        stage('Render Helm Template Test') {
+            steps {
+                script {
+                    def targetNamespace = params.namespace.trim()
+                    def targetServiceAccount = "${targetNamespace}-sa"
+
+                    sh """
+                        set -e
+
+                        echo "Render Helm template for validation ..."
+                        echo "Namespace      : ${targetNamespace}"
+                        echo "ServiceAccount : ${targetServiceAccount}"
+                        echo "Image          : ${imageRepository}:${params.imageTag}"
+                        echo "Replicas       : ${params.replicaCount}"
+
+                        helm template ${serviceName} ${helmChartDir} \\
+                          -n ${targetNamespace} \\
+                          -f ${helmChartDir}/${helmValuesFile} \\
+                          --set image.repository=${imageRepository} \\
+                          --set image.tag=${params.imageTag} \\
+                          --set replicaCount=${params.replicaCount} \\
+                          --set serviceAccount.name=${targetServiceAccount} \\
+                          --set log.pvcName=${logPvcName} \\
+                          --set log.mountPath=${logMountPath} \\
+                          --set log.storageClassName=${storageClass} \\
+                          --set log.size=${pvcSize} \\
+                          > rendered-${serviceName}.yaml
+
+                        echo ""
+                        echo "Rendered Kubernetes resources:"
+                        grep -E '^kind:' rendered-${serviceName}.yaml || true
+
+                        echo ""
+                        echo "Validate expected resources ..."
+                        grep -q 'kind: ConfigMap' rendered-${serviceName}.yaml
+                        grep -q 'kind: PersistentVolumeClaim' rendered-${serviceName}.yaml
+                        grep -q 'kind: Deployment' rendered-${serviceName}.yaml
+                        grep -q 'kind: Service' rendered-${serviceName}.yaml
+
+                        echo ""
+                        echo "Helm render test completed."
+                    """
+                }
+            }
+        }
+
+        stage('Build Container Image') {
+            when {
+                expression { params.buildFlag == 'true' }
+            }
+
+            steps {
+                sh """
+                    set -e
+
+                    echo "Check required files ..."
+                    test -f ${dockerFile}
+                    test -f ${zscalerCert}
+                    grep "BEGIN CERTIFICATE" ${zscalerCert}
+
+                    echo ""
+                    echo "Check Dockerfile base image ..."
+                    grep -n "^FROM" ${dockerFile}
+
+                    echo ""
+                    echo "Build container image ..."
+                    podman build \\
+                      --build-arg EXTRA_CA_CERT=${zscalerCert} \\
+                      --build-arg HTTP_PROXY=${proxyUrl} \\
+                      --build-arg HTTPS_PROXY=${proxyUrl} \\
+                      --build-arg http_proxy=${proxyUrl} \\
+                      --build-arg https_proxy=${proxyUrl} \\
+                      --build-arg NO_PROXY=${noProxyList} \\
+                      --build-arg no_proxy=${noProxyList} \\
+                      -f ${dockerFile} \\
+                      -t ${serviceName}:${params.imageTag} \\
+                      .
+
+                    echo ""
+                    echo "Save image to tar ..."
+                    podman save ${serviceName}:${params.imageTag} -o ${serviceName}_${params.imageTag}.tar
+
+                    echo ""
+                    echo "Validate image tar ..."
+                    ls -lh ${serviceName}_${params.imageTag}.tar
+                """
+            }
+        }
+
+        stage('Validate Push Requirement') {
+            when {
+                expression { params.pushFlag == 'true' }
+            }
+
+            steps {
+                script {
+                    if (params.buildFlag != 'true') {
+                        error """
+pushFlag=true requires buildFlag=true.
+
+Reason:
+The push stage needs local image tar file:
+${env.serviceName}_${params.imageTag}.tar
+
+Please rerun with:
+buildFlag=true
+pushFlag=true
+"""
+                    }
+                }
+            }
+        }
+
+        stage('Push Image to Nexus Registry') {
+            when {
+                expression { params.pushFlag == 'true' }
+            }
+
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    sh """
+                        set -e
+
+                        echo "Validate local image tar ..."
+                        test -f ${serviceName}_${params.imageTag}.tar
+                        ls -lh ${serviceName}_${params.imageTag}.tar
+
+                        echo ""
+                        echo "Copy image tar to remote bastion ..."
+                        scp -o StrictHostKeyChecking=no \\
+                          ${serviceName}_${params.imageTag}.tar \\
+                          root@${remoteHost}:/tmp/
+
+                        echo ""
+                        echo "Load, tag, and push image from remote bastion using Podman ..."
+                        ssh -o StrictHostKeyChecking=no root@${remoteHost} '
+                            set -e
+
+                            podman --version
+
+                            podman load -i /tmp/${serviceName}_${params.imageTag}.tar
+
+                            podman tag \\
+                              localhost/${serviceName}:${params.imageTag} \\
+                              ${imageRepository}:${params.imageTag}
+
+                            podman push ${imageRepository}:${params.imageTag}
+
+                            rm -f /tmp/${serviceName}_${params.imageTag}.tar
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Approval Deploy to OpenShift') {
+            when {
+                expression { params.deployFlag == 'true' }
+            }
+
+            steps {
+                script {
+                    def targetNamespace = params.namespace.trim()
+                    def targetKubeconfigId = "${targetNamespace}.kubeconfig"
+                    def targetServiceAccount = "${targetNamespace}-sa"
+
+                    def approvalMessage = """
+Please review deployment target:
+
+Deployment Method : Helm upgrade/install
+Helm Release      : ${env.serviceName}
+Helm Chart        : ${env.helmChartDir}
+Values File       : ${env.helmValuesFile}
+
+OCP Namespace     : ${targetNamespace}
+Kubeconfig ID     : ${targetKubeconfigId}
+ServiceAccount    : ${targetServiceAccount}
+
+Deployment        : ${env.serviceName}
+Service           : ${env.serviceName}
+Image             : ${env.imageRepository}:${params.imageTag}
+Replicas          : ${params.replicaCount}
+
+ConfigMap         : ${env.serviceName}-config
+Config File       : /etc/vp-fms/config.toml
+
+Log PVC           : ${env.logPvcName}
+Log Mount Path    : ${env.logMountPath}
+StorageClass      : ${env.storageClass}
+PVC Size          : ${env.pvcSize}
+Access Mode       : ReadWriteMany
+Volume Mode       : Filesystem
+
+Secret Reference  : vp-fms-interceptor-secret, only if enabled in Helm values
+
+CPU Request       : 500m
+Memory Request    : 256Mi
+CPU Limit         : 1
+Memory Limit      : 512Mi
+
+Continue deployment?
+"""
+                    input message: approvalMessage, ok: 'Deploy'
+                }
+            }
+        }
+
+        stage('Deploy to OpenShift using Helm') {
+            when {
+                expression { params.deployFlag == 'true' }
+            }
+
+            steps {
+                script {
+                    def targetNamespace = params.namespace.trim()
+                    def targetKubeconfigId = "${targetNamespace}.kubeconfig"
+                    def targetServiceAccount = "${targetNamespace}-sa"
+
+                    sshagent(credentials: [env.sshCredentials]) {
+                        withCredentials([file(credentialsId: targetKubeconfigId, variable: 'kubeconfig')]) {
+                            sh """
+                                set -e
+
+                                echo "Copy kubeconfig to remote bastion ..."
+                                scp -o StrictHostKeyChecking=no \\
+                                  "\$kubeconfig" \\
+                                  root@${remoteHost}:/tmp/${targetKubeconfigId}-${BUILD_NUMBER}
+
+                                echo ""
+                                echo "Copy Helm chart to remote bastion ..."
+                                scp -o StrictHostKeyChecking=no -r \\
+                                  ${helmChartDir} \\
+                                  root@${remoteHost}:/tmp/${serviceName}-chart-${BUILD_NUMBER}
+
+                                echo ""
+                                echo "Deploy application to OpenShift using Helm ..."
+                                ssh -o StrictHostKeyChecking=no root@${remoteHost} '
+                                    set -e
+
+                                    export KUBECONFIG=/tmp/${targetKubeconfigId}-${BUILD_NUMBER}
+
+                                    echo "Validate OpenShift access ..."
+                                    oc whoami
+                                    oc project ${targetNamespace}
+
+                                    echo ""
+                                    echo "Check Helm version ..."
+                                    helm version
+
+                                    echo ""
+                                    echo "Render Helm template on bastion before apply ..."
+                                    helm template ${serviceName} \\
+                                      /tmp/${serviceName}-chart-${BUILD_NUMBER} \\
+                                      -n ${targetNamespace} \\
+                                      -f /tmp/${serviceName}-chart-${BUILD_NUMBER}/${helmValuesFile} \\
+                                      --set image.repository=${imageRepository} \\
+                                      --set image.tag=${params.imageTag} \\
+                                      --set replicaCount=${params.replicaCount} \\
+                                      --set serviceAccount.name=${targetServiceAccount} \\
+                                      --set log.pvcName=${logPvcName} \\
+                                      --set log.mountPath=${logMountPath} \\
+                                      --set log.storageClassName=${storageClass} \\
+                                      --set log.size=${pvcSize} \\
+                                      > /tmp/${serviceName}-rendered-${BUILD_NUMBER}.yaml
+
+                                    echo ""
+                                    echo "Rendered resources:"
+                                    grep -E "^kind:" /tmp/${serviceName}-rendered-${BUILD_NUMBER}.yaml || true
+
+                                    echo ""
+                                    echo "Run Helm upgrade/install ..."
+                                    helm upgrade --install ${serviceName} \\
+                                      /tmp/${serviceName}-chart-${BUILD_NUMBER} \\
+                                      -n ${targetNamespace} \\
+                                      -f /tmp/${serviceName}-chart-${BUILD_NUMBER}/${helmValuesFile} \\
+                                      --set image.repository=${imageRepository} \\
+                                      --set image.tag=${params.imageTag} \\
+                                      --set replicaCount=${params.replicaCount} \\
+                                      --set serviceAccount.name=${targetServiceAccount} \\
+                                      --set log.pvcName=${logPvcName} \\
+                                      --set log.mountPath=${logMountPath} \\
+                                      --set log.storageClassName=${storageClass} \\
+                                      --set log.size=${pvcSize}
+
+                                    echo ""
+                                    echo "Check Helm release ..."
+                                    helm status ${serviceName} -n ${targetNamespace}
+
+                                    echo ""
+                                    echo "Check generated resources ..."
+                                    oc get configmap ${serviceName}-config -n ${targetNamespace}
+                                    oc get pvc ${logPvcName} -n ${targetNamespace}
+                                    oc get deploy ${serviceName} -n ${targetNamespace}
+                                    oc get svc ${serviceName} -n ${targetNamespace}
+                                    oc get pod -n ${targetNamespace} -l app=${serviceName} -o wide
+
+                                    echo ""
+                                    echo "Cleanup temporary files ..."
+                                    rm -f /tmp/${targetKubeconfigId}-${BUILD_NUMBER}
+                                    rm -rf /tmp/${serviceName}-chart-${BUILD_NUMBER}
+                                    rm -f /tmp/${serviceName}-rendered-${BUILD_NUMBER}.yaml
+                                '
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh """
+                set +e
+                rm -f ${serviceName}_*.tar
+                rm -f rendered-${serviceName}.yaml
+            """
+
+            cleanWs()
+        }
+
+        success {
+            echo 'Pipeline Completed'
+        }
+
+        failure {
+            echo 'Pipeline Failed'
+        }
+    }
+}
