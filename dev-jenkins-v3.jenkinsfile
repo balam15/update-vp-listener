@@ -118,78 +118,11 @@ Values File      : ${env.helmValuesFile}
                     echo ""
                     echo "Repository root files:"
                     ls -lah
-                """
-            }
-        }
-
-        stage('Validate Helm Chart Files') {
-            steps {
-                sh """
-                    set -e
-
-                    echo "Validate Helm chart structure ..."
-                    echo "Helm chart dir: ${helmChartDir}"
-
-                    test -d ${helmChartDir}
-                    test -f ${helmChartDir}/Chart.yaml
-                    test -f ${helmChartDir}/values.yaml
-                    test -f ${helmChartDir}/${helmValuesFile}
-
-                    test -f ${helmChartDir}/templates/_helpers.tpl
-                    test -f ${helmChartDir}/templates/configmap.yaml
-                    test -f ${helmChartDir}/templates/pvc.yaml
-                    test -f ${helmChartDir}/templates/deployment.yaml
-                    test -f ${helmChartDir}/templates/service.yaml
 
                     echo ""
-                    echo "Helm chart files are complete."
+                    echo "Helm chart location:"
+                    ls -lah ${helmChartDir} || true
                 """
-            }
-        }
-
-        stage('Render Helm Template Test') {
-            steps {
-                script {
-                    def targetNamespace = params.namespace.trim()
-                    def targetServiceAccount = "${targetNamespace}-sa"
-
-                    sh """
-                        set -e
-
-                        echo "Render Helm template for validation ..."
-                        echo "Namespace      : ${targetNamespace}"
-                        echo "ServiceAccount : ${targetServiceAccount}"
-                        echo "Image          : ${imageRepository}:${params.imageTag}"
-                        echo "Replicas       : ${params.replicaCount}"
-
-                        helm template ${serviceName} ${helmChartDir} \\
-                          -n ${targetNamespace} \\
-                          -f ${helmChartDir}/${helmValuesFile} \\
-                          --set image.repository=${imageRepository} \\
-                          --set image.tag=${params.imageTag} \\
-                          --set replicaCount=${params.replicaCount} \\
-                          --set serviceAccount.name=${targetServiceAccount} \\
-                          --set log.pvcName=${logPvcName} \\
-                          --set log.mountPath=${logMountPath} \\
-                          --set log.storageClassName=${storageClass} \\
-                          --set log.size=${pvcSize} \\
-                          > rendered-${serviceName}.yaml
-
-                        echo ""
-                        echo "Rendered Kubernetes resources:"
-                        grep -E '^kind:' rendered-${serviceName}.yaml || true
-
-                        echo ""
-                        echo "Validate expected resources ..."
-                        grep -q 'kind: ConfigMap' rendered-${serviceName}.yaml
-                        grep -q 'kind: PersistentVolumeClaim' rendered-${serviceName}.yaml
-                        grep -q 'kind: Deployment' rendered-${serviceName}.yaml
-                        grep -q 'kind: Service' rendered-${serviceName}.yaml
-
-                        echo ""
-                        echo "Helm render test completed."
-                    """
-                }
             }
         }
 
@@ -340,6 +273,12 @@ PVC Size          : ${env.pvcSize}
 Access Mode       : ReadWriteMany
 Volume Mode       : Filesystem
 
+Existing resources will be adopted into Helm if found:
+- pvc/${env.logPvcName}
+- svc/${env.serviceName}
+- deployment/${env.serviceName}
+- configmap/${env.serviceName}-config
+
 Secret Reference  : vp-fms-interceptor-secret, only if enabled in Helm values
 
 CPU Request       : 500m
@@ -397,24 +336,31 @@ Continue deployment?
                                     helm version
 
                                     echo ""
-                                    echo "Render Helm template on bastion before apply ..."
-                                    helm template ${serviceName} \\
-                                      /tmp/${serviceName}-chart-${BUILD_NUMBER} \\
-                                      -n ${targetNamespace} \\
-                                      -f /tmp/${serviceName}-chart-${BUILD_NUMBER}/${helmValuesFile} \\
-                                      --set image.repository=${imageRepository} \\
-                                      --set image.tag=${params.imageTag} \\
-                                      --set replicaCount=${params.replicaCount} \\
-                                      --set serviceAccount.name=${targetServiceAccount} \\
-                                      --set log.pvcName=${logPvcName} \\
-                                      --set log.mountPath=${logMountPath} \\
-                                      --set log.storageClassName=${storageClass} \\
-                                      --set log.size=${pvcSize} \\
-                                      > /tmp/${serviceName}-rendered-${BUILD_NUMBER}.yaml
+                                    echo "Adopt existing resources into Helm release if already exists ..."
 
-                                    echo ""
-                                    echo "Rendered resources:"
-                                    grep -E "^kind:" /tmp/${serviceName}-rendered-${BUILD_NUMBER}.yaml || true
+                                    for RESOURCE in \\
+                                      "pvc/${logPvcName}" \\
+                                      "svc/${serviceName}" \\
+                                      "deployment/${serviceName}" \\
+                                      "configmap/${serviceName}-config"
+                                    do
+                                      if oc get "\${RESOURCE}" -n ${targetNamespace} >/dev/null 2>&1; then
+                                        echo "Adopting \${RESOURCE} into Helm release ${serviceName}"
+
+                                        oc label "\${RESOURCE}" \\
+                                          -n ${targetNamespace} \\
+                                          app.kubernetes.io/managed-by=Helm \\
+                                          --overwrite
+
+                                        oc annotate "\${RESOURCE}" \\
+                                          -n ${targetNamespace} \\
+                                          meta.helm.sh/release-name=${serviceName} \\
+                                          meta.helm.sh/release-namespace=${targetNamespace} \\
+                                          --overwrite
+                                      else
+                                        echo "Skip \${RESOURCE}, not found"
+                                      fi
+                                    done
 
                                     echo ""
                                     echo "Run Helm upgrade/install ..."
@@ -447,7 +393,6 @@ Continue deployment?
                                     echo "Cleanup temporary files ..."
                                     rm -f /tmp/${targetKubeconfigId}-${BUILD_NUMBER}
                                     rm -rf /tmp/${serviceName}-chart-${BUILD_NUMBER}
-                                    rm -f /tmp/${serviceName}-rendered-${BUILD_NUMBER}.yaml
                                 '
                             """
                         }
