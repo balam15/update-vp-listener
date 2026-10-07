@@ -18,7 +18,8 @@ RUN apk add --no-cache \
     openssl-libs-static \
     curl-dev \
     zlib-dev \
-    build-base
+    build-base \
+    cmake
 
 COPY rust-interceptor/Cargo.toml rust-interceptor/Cargo.lock ./
 COPY rust-interceptor/src ./src
