@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.log.pvcName }}
+  labels:
+{{ include "vp-fms-interceptor.labels" . | indent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.log.accessMode }}
+  volumeMode: Filesystem
+  storageClassName: {{ .Values.log.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.log.size }}

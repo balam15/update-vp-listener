@@ -1,0 +1,6 @@
+apiVersion: v2
+name: vp-fms-interceptor
+description: Helm chart for VP FMS Interceptor on OpenShift
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

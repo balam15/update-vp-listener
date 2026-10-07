@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vp-fms-interceptor.fullname" . }}
+  labels:
+{{ include "vp-fms-interceptor.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "vp-fms-interceptor.selectorLabels" . | indent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "vp-fms-interceptor.selectorLabels" . | indent 8 }}
+      annotations:
+        checksum/config: {{ .Values.config.content | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: {{ include "vp-fms-interceptor.fullname" . }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              mkdir -p {{ .Values.log.mountPath }}
+              LOG_FILE="{{ .Values.log.mountPath }}/${HOSTNAME}.log"
+              echo "Starting vp-fms-interceptor, log file: ${LOG_FILE}"
+              /usr/local/bin/vp-fms-interceptor {{ .Values.config.mountDir }}/{{ .Values.config.fileName | default "config.toml" }} 2>&1 | tee -a "${LOG_FILE}"
+
+          ports:
+            - name: {{ .Values.service.ports.main.name }}
+              containerPort: {{ .Values.service.ports.main.targetPort }}
+              protocol: {{ .Values.service.ports.main.protocol }}
+            - name: {{ .Values.service.ports.admin.name }}
+              containerPort: {{ .Values.service.ports.admin.targetPort }}
+              protocol: {{ .Values.service.ports.admin.protocol }}
+
+          {{- if .Values.secret.enabled }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secret.existingSecretName }}
+          {{- end }}
+
+          volumeMounts:
+            - name: app-log
+              mountPath: {{ .Values.log.mountPath }}
+            - name: app-config
+              mountPath: {{ .Values.config.mountDir }}
+              readOnly: true
+
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: {{ .Values.probes.readiness.port }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: {{ .Values.probes.liveness.port }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu | quote }}
+              memory: {{ .Values.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu | quote }}
+              memory: {{ .Values.resources.limits.memory | quote }}
+
+      volumes:
+        - name: app-log
+          persistentVolumeClaim:
+            claimName: {{ .Values.log.pvcName }}
+        - name: app-config
+          configMap:
+            name: {{ include "vp-fms-interceptor.fullname" . }}-config
+            items:
+              - key: {{ .Values.config.fileName | default "config.toml" }}
+                path: {{ .Values.config.fileName | default "config.toml" }}
