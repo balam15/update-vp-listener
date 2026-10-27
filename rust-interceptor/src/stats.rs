@@ -84,7 +84,58 @@ pub struct Stats {
     pub conn_duration_count: AtomicU64,
     pub conn_duration_sum_ms: AtomicU64,
     pub conn_duration_max_ms: AtomicU64,
+
+    // -- inbound (VP -> listener) -------------------------------------------
+    /// accept() itself failed (EMFILE etc). Otherwise only visible in logs.
+    pub accept_errors: AtomicU64,
+    /// Connections where both directions ended cleanly.
+    pub conns_closed_clean: AtomicU64,
+    /// Connections where at least one direction ended with an IO error or panic.
+    pub conns_closed_error: AtomicU64,
+    /// Directions closed by the idle timeout (only when idle_timeout_ms > 0).
+    pub conns_idle_closed: AtomicU64,
+    pub pump_panics: AtomicU64,
+
+    // -- outbound (listener -> FMS) -----------------------------------------
+    // FMS is only dialed when VP connects, so there is no background probe:
+    // this is the state as observed by real traffic.
+    pub upstream_connect_attempts: AtomicU64,
+    pub upstream_connect_ok: AtomicU64,
+    /// Connect returned an error (refused, unreachable, reset...).
+    pub upstream_connect_refused: AtomicU64,
+    /// Connect did not finish within connect_timeout_ms.
+    pub upstream_connect_timeout: AtomicU64,
+    /// Time to establish the FMS connection, successful dials only.
+    pub upstream_connect_count: AtomicU64,
+    pub upstream_connect_sum_us: AtomicU64,
+    pub upstream_connect_max_us: AtomicU64,
+    /// GAUGE: FMS connections currently open.
+    pub upstream_conns_active: AtomicU64,
+    /// GAUGE: 1 if the most recent FMS dial succeeded, 0 if it failed.
+    /// Stays 0 until the first attempt; read it with upstream_connect_attempts.
+    pub upstream_last_connect_ok: AtomicU64,
+
+    // -- outbound (listener -> Kafka) ---------------------------------------
+    /// GAUGE: 1 if at least one broker is UP, from librdkafka statistics.
+    pub kafka_connected: AtomicU64,
+    /// GAUGE: brokers in state UP / UPDATE, and brokers librdkafka knows of.
+    pub kafka_brokers_up: AtomicU64,
+    pub kafka_brokers_total: AtomicU64,
+    /// librdkafka's error callback fired (broker down, auth, resolve...).
+    pub kafka_errors: AtomicU64,
+    /// Subset of kafka_errors: every broker connection is down.
+    pub kafka_all_brokers_down: AtomicU64,
 }
+
+/// Metrics that go up and down. Everything else in `snapshot()` is a counter.
+pub const GAUGES: &[&str] = &[
+    "conns_active",
+    "upstream_conns_active",
+    "upstream_last_connect_ok",
+    "kafka_connected",
+    "kafka_brokers_up",
+    "kafka_brokers_total",
+];
 
 impl Stats {
     // LEARN: `#[inline]` is a hint that this should be inlined even ACROSS CRATE
@@ -154,6 +205,11 @@ impl Stats {
     //       while (!max.compareAndSet(prev, n));
     //   Five lines of easily-mis-written code versus one method call.
     #[inline]
+    pub fn set(gauge: &AtomicU64, n: u64) {
+        gauge.store(n, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn max(counter: &AtomicU64, n: u64) {
         counter.fetch_max(n, Ordering::Relaxed);
     }
@@ -215,6 +271,52 @@ impl Stats {
             (
                 "conn_duration_max_ms",
                 Self::get(&self.conn_duration_max_ms),
+            ),
+            ("accept_errors", Self::get(&self.accept_errors)),
+            ("conns_closed_clean", Self::get(&self.conns_closed_clean)),
+            ("conns_closed_error", Self::get(&self.conns_closed_error)),
+            ("conns_idle_closed", Self::get(&self.conns_idle_closed)),
+            ("pump_panics", Self::get(&self.pump_panics)),
+            (
+                "upstream_connect_attempts",
+                Self::get(&self.upstream_connect_attempts),
+            ),
+            ("upstream_connect_ok", Self::get(&self.upstream_connect_ok)),
+            (
+                "upstream_connect_refused",
+                Self::get(&self.upstream_connect_refused),
+            ),
+            (
+                "upstream_connect_timeout",
+                Self::get(&self.upstream_connect_timeout),
+            ),
+            (
+                "upstream_connect_count",
+                Self::get(&self.upstream_connect_count),
+            ),
+            (
+                "upstream_connect_sum_us",
+                Self::get(&self.upstream_connect_sum_us),
+            ),
+            (
+                "upstream_connect_max_us",
+                Self::get(&self.upstream_connect_max_us),
+            ),
+            (
+                "upstream_conns_active",
+                Self::get(&self.upstream_conns_active),
+            ),
+            (
+                "upstream_last_connect_ok",
+                Self::get(&self.upstream_last_connect_ok),
+            ),
+            ("kafka_connected", Self::get(&self.kafka_connected)),
+            ("kafka_brokers_up", Self::get(&self.kafka_brokers_up)),
+            ("kafka_brokers_total", Self::get(&self.kafka_brokers_total)),
+            ("kafka_errors", Self::get(&self.kafka_errors)),
+            (
+                "kafka_all_brokers_down",
+                Self::get(&self.kafka_all_brokers_down),
             ),
         ]
     }

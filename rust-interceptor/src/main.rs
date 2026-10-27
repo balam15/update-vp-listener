@@ -287,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
                         // LEARN: the Err arm ends in `continue`, which never
                         //   produces a value. Rust types that as `!` ("never"),
                         //   which coerces to any type, so both arms typecheck.
+                        Stats::inc(&stats.accept_errors);
                         tracing::warn!(error = %e, "accept failed");
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         continue;

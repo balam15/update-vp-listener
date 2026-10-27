@@ -129,7 +129,12 @@ fn prometheus(stats: &Stats) -> String {
         //   It runs once per scrape interval so it genuinely does not matter;
         //   it is worth noticing as the general idiom: FORMAT! ALLOCATES,
         //   WRITE! APPENDS.
-        out.push_str(&format!("# TYPE vp_interceptor_{name} counter\n"));
+        let kind = if crate::stats::GAUGES.contains(&name) {
+            "gauge"
+        } else {
+            "counter"
+        };
+        out.push_str(&format!("# TYPE vp_interceptor_{name} {kind}\n"));
         out.push_str(&format!("vp_interceptor_{name} {value}\n"));
     }
     out

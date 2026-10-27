@@ -10,9 +10,9 @@
 // ============================================================================
 
 use std::io;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // LEARN: Bytes / BytesMut, from the `bytes` crate. These are the centre of the
 //   memory story:
@@ -69,6 +69,8 @@ pub async fn handle(
     stats: Arc<Stats>,
 ) {
     let connect = TcpStream::connect(&cfg.upstream.addr);
+    Stats::inc(&stats.upstream_connect_attempts);
+    let dial_started = Instant::now();
     // LEARN: NESTED PATTERN MATCHING, one of Rust's genuinely nice features.
     //   timeout() returns Result<Result<TcpStream, io::Error>, Elapsed>:
     //     outer = "did we time out?"   inner = "did the connect succeed?"
@@ -83,10 +85,23 @@ pub async fn handle(
     )
     .await
     {
-        Ok(Ok(s)) => s, // connected
+        Ok(Ok(s)) => {
+            // connected
+            Stats::inc(&stats.upstream_connect_ok);
+            Stats::set(&stats.upstream_last_connect_ok, 1);
+            Stats::observe(
+                &stats.upstream_connect_count,
+                &stats.upstream_connect_sum_us,
+                &stats.upstream_connect_max_us,
+                dial_started.elapsed().as_micros() as u64,
+            );
+            s
+        }
         Ok(Err(e)) => {
             // connect refused / failed
             Stats::inc(&stats.upstream_connect_failed);
+            Stats::inc(&stats.upstream_connect_refused);
+            Stats::set(&stats.upstream_last_connect_ok, 0);
             tracing::warn!(conn_id, %peer, upstream = %cfg.upstream.addr, error = %e, "upstream connect failed");
             // LEARN: bare `return` in a function returning `()`.
             return;
@@ -94,10 +109,13 @@ pub async fn handle(
         Err(_) => {
             // timed out
             Stats::inc(&stats.upstream_connect_failed);
+            Stats::inc(&stats.upstream_connect_timeout);
+            Stats::set(&stats.upstream_last_connect_ok, 0);
             tracing::warn!(conn_id, %peer, upstream = %cfg.upstream.addr, "upstream connect timed out");
             return;
         }
     };
+    stats.upstream_conns_active.fetch_add(1, Ordering::Relaxed);
 
     if cfg.proxy.nodelay {
         // Nagle would coalesce small ISO 8583 messages and add tens of
@@ -170,6 +188,7 @@ pub async fn handle(
     //   to_fms first, then to_vp. Since we want both to finish regardless, that
     //   is correct -- but it is not obvious from the shape, and it would bite
     //   you if the arms had side effects whose order mattered.
+    let mut errored = false;
     for (dir, joined) in [
         (Direction::VpToFms.as_str(), to_fms.await),
         (Direction::FmsToVp.as_str(), to_vp.await),
@@ -181,15 +200,28 @@ pub async fn handle(
             Ok(Ok(())) => {}
             // LEARN: task finished, pump returned an IO error. `debug` level,
             //   because a connection reset is completely routine.
-            Ok(Err(e)) => tracing::debug!(conn_id, direction = dir, error = %e, "stream ended"),
+            Ok(Err(e)) => {
+                errored = true;
+                tracing::debug!(conn_id, direction = dir, error = %e, "stream ended");
+            }
             // LEARN: THE TASK PANICKED. JoinHandle's error type is JoinError.
             //   `error` level, because a panic is a bug.
             // LEARN: this is where the Cargo.toml decision cashes out -- because
             //   panics UNWIND rather than abort, a bug in one connection surfaces
             //   here as a log line while every other connection keeps running.
-            Err(e) => tracing::error!(conn_id, direction = dir, error = %e, "pump task panicked"),
+            Err(e) => {
+                errored = true;
+                Stats::inc(&stats.pump_panics);
+                tracing::error!(conn_id, direction = dir, error = %e, "pump task panicked");
+            }
         }
     }
+    stats.upstream_conns_active.fetch_sub(1, Ordering::Relaxed);
+    Stats::inc(if errored {
+        &stats.conns_closed_error
+    } else {
+        &stats.conns_closed_clean
+    });
 
     // LEARN: after both directions end, so the tee worker can free its
     //   per-connection framer and timing state.
@@ -261,6 +293,7 @@ async fn pump(
                     // JAVA: enum.name() returns a cached String object; also
                     //   cheap after the first call, but still an object with a
                     //   header rather than a raw pointer into .rodata.
+                    Stats::inc(&stats.conns_idle_closed);
                     tracing::debug!(conn_id, direction = dir.as_str(), "idle timeout");
                     let _ = wr.shutdown().await;
                     return Ok(());

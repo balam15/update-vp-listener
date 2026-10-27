@@ -23,7 +23,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use rdkafka::client::ClientContext;
 use rdkafka::config::ClientConfig;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, OwnedHeaders};
+use rdkafka::statistics::Statistics;
 use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
 use serde::Serialize;
 
@@ -46,7 +48,41 @@ pub struct CountingContext {
 //   every method, so implementing it requires no code at all. It is effectively
 //   a marker: "this type is eligible to be a client context".
 // JAVA: an interface with all-default methods (Java 8+). Same idea.
-impl ClientContext for CountingContext {}
+impl ClientContext for CountingContext {
+    // Broker connection state, from librdkafka's periodic statistics (enabled
+    // via statistics.interval.ms in build()). Runs on librdkafka's thread.
+    fn stats(&self, statistics: Statistics) {
+        let total = statistics.brokers.len() as u64;
+        let up = statistics
+            .brokers
+            .values()
+            .filter(|b| b.state == "UP" || b.state == "UPDATE")
+            .count() as u64;
+        Stats::set(&self.stats.kafka_brokers_total, total);
+        Stats::set(&self.stats.kafka_brokers_up, up);
+        Stats::set(&self.stats.kafka_connected, u64::from(up > 0));
+    }
+
+    // Global client errors (broker transport failure, resolve, auth...). The
+    // default implementation only logs; we count too, with the same rate limit
+    // as delivery failures.
+    fn error(&self, error: KafkaError, reason: &str) {
+        let n = self
+            .stats
+            .kafka_errors
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if matches!(
+            error,
+            KafkaError::Global(RDKafkaErrorCode::AllBrokersDown)
+        ) {
+            Stats::inc(&self.stats.kafka_all_brokers_down);
+        }
+        if n == 1 || n % self.log_every == 0 {
+            tracing::warn!(errors = n, error = %error, reason, "kafka client error");
+        }
+    }
+}
 
 impl ProducerContext for CountingContext {
     // LEARN: `type DeliveryOpaque = ();` is an ASSOCIATED TYPE. The trait
@@ -381,7 +417,11 @@ impl Publisher {
             // Never let a full internal queue block the caller. Combined with our
             // own bounded tee queue this makes the whole publish path total.
             .set("queue.buffering.max.ms", cfg.linger_ms.to_string())
-            .set("enable.idempotence", "false");
+            .set("enable.idempotence", "false")
+            // Drives ClientContext::stats() -> kafka_brokers_* gauges. Applied
+            // before cfg.properties so config can still override it (0 disables,
+            // and the gauges then stay at 0).
+            .set("statistics.interval.ms", "5000");
 
         // LEARN: `for (k, v) in &cfg.properties` iterates a BTreeMap BY
         //   REFERENCE, yielding (&String, &String). Iterating `cfg.properties`

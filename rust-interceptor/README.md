@@ -51,6 +51,56 @@ Counters worth reading first: `tee_dropped` (Kafka is degraded — and it proves
 the hot path was not), `framer_desyncs` (wire framing does not match
 `[framing]`), and `upstream_connect_failed`.
 
+### Metrics reference
+
+Every metric is prefixed `vp_interceptor_`. All are counters except the six
+marked **gauge**. Timing metrics come as `_count` / `_sum` / `_max` triples, so
+average = `sum / count` over whatever window you query; there are no histograms.
+
+| Hop | Metric | Meaning |
+|---|---|---|
+| VP → listener | `conns_accepted` | VP connections accepted |
+| | `conns_active` **gauge** | connections open now |
+| | `conns_rejected` | closed immediately because `max_connections` was hit |
+| | `accept_errors` | `accept()` itself failed (e.g. out of file descriptors) |
+| | `conns_closed_clean` | both directions ended cleanly |
+| | `conns_closed_error` | a direction ended with an IO error or panic |
+| | `conns_idle_closed` | directions closed by `idle_timeout_ms` |
+| | `pump_panics` | pump task panicked (a bug) |
+| | `conn_duration_{count,sum_ms,max_ms}` | connection lifetime, accept → close |
+| | `bytes_vp_to_fms` | bytes forwarded VP → FMS |
+| listener → FMS | `upstream_connect_attempts` | FMS dials |
+| | `upstream_connect_ok` | dials that succeeded |
+| | `upstream_connect_refused` | dial returned an error |
+| | `upstream_connect_timeout` | dial exceeded `connect_timeout_ms` |
+| | `upstream_connect_failed` | refused + timeout |
+| | `upstream_connect_{count,sum_us,max_us}` | connect time, successful dials only |
+| | `upstream_conns_active` **gauge** | FMS connections open now |
+| | `upstream_last_connect_ok` **gauge** | 1 if the latest dial succeeded, 0 if it failed |
+| | `bytes_fms_to_vp` | bytes forwarded FMS → VP |
+| | `rtt_{count,sum_us,max_us}` | request forwarded → matching response seen |
+| | `rtt_unmatched` | requests closed with no response |
+| tee | `tee_accepted` / `tee_dropped` | chunks queued / dropped because a shard queue was full |
+| | `frames_emitted` | complete messages reassembled |
+| | `framer_desyncs` | framing lost sync |
+| listener → Kafka | `kafka_enqueued` / `kafka_enqueue_failed` | handed to librdkafka / its queue was full |
+| | `kafka_delivered` / `kafka_delivery_failed` | broker ack / delivery failed |
+| | `kafka_connected` **gauge** | 1 if at least one broker is UP |
+| | `kafka_brokers_up` **gauge** | brokers UP |
+| | `kafka_brokers_total` **gauge** | brokers librdkafka knows of |
+| | `kafka_errors` | librdkafka error callbacks (transport, resolve, auth…) |
+| | `kafka_all_brokers_down` | subset of `kafka_errors`: every broker down |
+
+Two caveats on connection state:
+
+- **FMS state is passive.** FMS is only dialed when a VP connection arrives, so
+  `upstream_last_connect_ok` reflects the last real attempt and reads 0 before
+  the first one. Read it together with `upstream_connect_attempts`.
+- **Kafka state is refreshed every 5 s.** The producer sets
+  `statistics.interval.ms=5000` to feed the `kafka_brokers_*` gauges. A
+  `[kafka.properties]` entry overrides it; `0` disables the callback and the
+  gauges stay at 0.
+
 `[kafka.filter]` can drop exact-match frames from Kafka only. The current rule
 is echo traffic: MTI `0800`/`0810` with `de70 = "301"`. Frames that cannot be
 parsed for filtering are still published.
@@ -65,7 +115,7 @@ parsed for filtering are still published.
 | `src/framing.rs` | length-prefix reassembler (unit-tested) |
 | `src/parse.rs` | `key=value` field extraction (unit-tested) |
 | `src/kafka.rs` | fire-and-forget producer, JSON envelope, encodings |
-| `src/stats.rs` | atomic counters |
+| `src/stats.rs` | atomic counters and gauges |
 | `src/admin.rs` | `/metrics`, `/healthz` — hand-rolled, no web framework |
 
 No web framework on purpose: this process sits inline on an authorization path,
