@@ -125,6 +125,18 @@ pub struct Stats {
     pub kafka_errors: AtomicU64,
     /// Subset of kafka_errors: every broker connection is down.
     pub kafka_all_brokers_down: AtomicU64,
+
+    // -- performance test (TPS) ---------------------------------------------
+    // These back the vp_* metrics exposed on /metrics with their literal names
+    // (no vp_interceptor_ prefix) for load-test dashboards. Only this one is a
+    // new counter; the rest of the vp_* metrics are DERIVED in admin.rs from the
+    // existing counters above, so no extra increments are added anywhere else.
+    //
+    /// Reports received from VP: one per VP -> FMS frame reassembled on the tee
+    /// side. In this transparent interceptor every VP report becomes exactly one
+    /// ISO 8583 request forwarded to FMS, so this also serves as the ISO 8583
+    /// request count. Incremented on a tee worker, never on the forwarding path.
+    pub vp_reports_received: AtomicU64,
 }
 
 /// Metrics that go up and down. Everything else in `snapshot()` is a counter.

@@ -137,7 +137,88 @@ fn prometheus(stats: &Stats) -> String {
         out.push_str(&format!("# TYPE vp_interceptor_{name} {kind}\n"));
         out.push_str(&format!("vp_interceptor_{name} {value}\n"));
     }
+    perf_test_metrics(stats, &mut out);
     out
+}
+
+/// Performance-test (TPS) metrics, exposed with their literal public names (no
+/// `vp_interceptor_` prefix) so the load-test PromQL can reference them directly,
+/// e.g. `rate(vp_rest_success_total[1m])`.
+///
+/// "rest" is the Kafka leg; "iso8583" is the FMS leg. All seven are monotonic
+/// counters. Only `vp_reports_received_total` is a dedicated counter; the others
+/// are derived here from the counters already maintained on the hot and tee
+/// paths, so adding them changes no existing behaviour.
+///
+///   vp_reports_received_total  reports received from VP (VP -> FMS frames)
+///   vp_rest_requests_total     publish attempts to Kafka (enqueued + enqueue-failed)
+///   vp_rest_success_total      frames delivered to a broker
+///   vp_rest_failed_total       enqueue failures + delivery failures
+///   vp_iso8583_requests_total  requests forwarded to FMS (= reports received)
+///   vp_iso8583_success_total   FMS responses matched to a request
+///   vp_iso8583_failed_total    requests that closed without a matching response
+///
+/// Note: the iso8583 success/failed split comes from the request/response
+/// pairing, so it requires `[timing] enabled = true` and `pair_request_response
+/// = true` (both on by default). With timing off, requests still counts but
+/// success/failed stay at 0.
+fn perf_test_metrics(stats: &Stats, out: &mut String) {
+    let reports = Stats::get(&stats.vp_reports_received);
+
+    let enqueued = Stats::get(&stats.kafka_enqueued);
+    let enqueue_failed = Stats::get(&stats.kafka_enqueue_failed);
+    let delivered = Stats::get(&stats.kafka_delivered);
+    let delivery_failed = Stats::get(&stats.kafka_delivery_failed);
+
+    let rest_requests = enqueued + enqueue_failed;
+    let rest_success = delivered;
+    let rest_failed = enqueue_failed + delivery_failed;
+
+    let iso_requests = reports;
+    let iso_success = Stats::get(&stats.rtt_count);
+    let iso_failed = Stats::get(&stats.rtt_unmatched);
+
+    for (name, help, value) in [
+        (
+            "vp_reports_received_total",
+            "Reports received from VP (one per VP->FMS frame reassembled)",
+            reports,
+        ),
+        (
+            "vp_rest_requests_total",
+            "Publish attempts to Kafka (enqueued + enqueue-failed)",
+            rest_requests,
+        ),
+        (
+            "vp_rest_success_total",
+            "Frames delivered to a Kafka broker",
+            rest_success,
+        ),
+        (
+            "vp_rest_failed_total",
+            "Kafka enqueue failures plus delivery failures",
+            rest_failed,
+        ),
+        (
+            "vp_iso8583_requests_total",
+            "Requests forwarded to FMS (equals reports received from VP)",
+            iso_requests,
+        ),
+        (
+            "vp_iso8583_success_total",
+            "FMS responses matched to a forwarded request",
+            iso_success,
+        ),
+        (
+            "vp_iso8583_failed_total",
+            "Requests that closed without a matching FMS response",
+            iso_failed,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}\n"));
+        out.push_str(&format!("# TYPE {name} counter\n"));
+        out.push_str(&format!("{name} {value}\n"));
+    }
 }
 
 fn json(stats: &Stats) -> String {

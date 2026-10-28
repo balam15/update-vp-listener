@@ -540,6 +540,12 @@ impl Worker {
                         for frame in frames {
                             entry.seq += 1;
                             Stats::inc(&self.stats.frames_emitted);
+                            // Performance-test counter: one report per VP -> FMS
+                            // frame. Off the forwarding path (tee worker), so it
+                            // cannot affect VP<->FMS latency.
+                            if dir == Direction::VpToFms {
+                                Stats::inc(&self.stats.vp_reports_received);
+                            }
 
                             // Timing is measured per frame, not per chunk, so a
                             // pipelined read yields one measurement per message.
