@@ -345,6 +345,17 @@ struct Envelope<'a> {
     payload: &'a str,
 }
 
+/// Outcome of a single `publish` call, returned so the tee can count the Kafka
+/// result per direction (used for the VP->FMS request metrics).
+pub enum Published {
+    /// Handed to librdkafka's send queue.
+    Enqueued,
+    /// Dropped by the `[kafka.filter]` rule on purpose (e.g. echo/sign-on).
+    Filtered,
+    /// Enqueue rejected or JSON-encode failed.
+    Failed,
+}
+
 pub struct Publisher {
     producer: ThreadedProducer<CountingContext>,
     topic: String,
@@ -496,15 +507,21 @@ impl Publisher {
     /// base64 allocations here cannot affect VP<->FMS latency.
     // LEARN: `&Meta<'_>` -- anonymous lifetime again: "a Meta borrowed from
     //   somewhere, I do not need to relate its lifetime to anything else here".
-    pub fn publish(&self, key: &str, meta: &Meta<'_>, frame: &[u8]) {
+    pub fn publish(&self, key: &str, meta: &Meta<'_>, frame: &[u8]) -> Published {
         if should_drop_frame(&self.filter, frame) {
-            return;
+            return Published::Filtered;
         }
 
         let headers = self.headers(meta);
 
         match self.value_format {
-            ValueFormat::Raw => self.send(key, frame, headers),
+            ValueFormat::Raw => {
+                if self.send(key, frame, headers) {
+                    Published::Enqueued
+                } else {
+                    Published::Failed
+                }
+            }
             ValueFormat::Json => {
                 let payload = self.payload_encoding.encode(frame);
 
@@ -563,19 +580,26 @@ impl Publisher {
                     payload: &payload,
                 };
                 match serde_json::to_vec(&envelope) {
-                    Ok(body) => self.send(key, &body, headers),
+                    Ok(body) => {
+                        if self.send(key, &body, headers) {
+                            Published::Enqueued
+                        } else {
+                            Published::Failed
+                        }
+                    }
                     Err(e) => {
                         // Should be unreachable: every field is a plain scalar or
                         // an already-encoded string.
                         Stats::inc(&self.stats.kafka_enqueue_failed);
                         tracing::error!(error = %e, "json encode failed; dropping frame");
+                        Published::Failed
                     }
                 }
             }
         }
     }
 
-    fn send(&self, key: &str, value: &[u8], headers: OwnedHeaders) {
+    fn send(&self, key: &str, value: &[u8], headers: OwnedHeaders) -> bool {
         payload_log::log_bytes(
             &self.debug_payload,
             key.parse().unwrap_or(0),
@@ -600,13 +624,17 @@ impl Publisher {
             BaseRecord::to(&self.topic).key(key).payload(value).headers(headers);
 
         match self.producer.send(record) {
-            Ok(()) => Stats::inc(&self.stats.kafka_enqueued),
+            Ok(()) => {
+                Stats::inc(&self.stats.kafka_enqueued);
+                true
+            }
             Err((err, _rejected)) => {
                 Stats::inc(&self.stats.kafka_enqueue_failed);
                 let n = self.enqueue_fail_log.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == 1 || n % 1000 == 0 {
                     tracing::warn!(failures = n, error = %err, "kafka enqueue rejected (queue full?); dropping");
                 }
+                false
             }
         }
     }

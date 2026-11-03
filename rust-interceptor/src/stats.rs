@@ -137,6 +137,14 @@ pub struct Stats {
     /// ISO 8583 request forwarded to FMS, so this also serves as the ISO 8583
     /// request count. Incremented on a tee worker, never on the forwarding path.
     pub vp_reports_received: AtomicU64,
+
+    /// Kafka publish outcome for VP -> FMS request frames ONLY (not FMS
+    /// responses), so the REST/Kafka metrics are one-per-transaction and line up
+    /// with the VP/ISO 8583 request count even when publish_directions = "both".
+    /// `ok` = handed to librdkafka; `failed` = enqueue rejected or encode error.
+    /// Frames dropped by [kafka.filter] (echo/sign-on) are counted in neither.
+    pub vp_kafka_req_ok: AtomicU64,
+    pub vp_kafka_req_failed: AtomicU64,
 }
 
 /// Metrics that go up and down. Everything else in `snapshot()` is a counter.

@@ -593,7 +593,22 @@ impl Worker {
                                 "kafka_frame_ready",
                                 &frame,
                             );
-                            self.publisher.publish(&key, &meta, &frame);
+                            let published = self.publisher.publish(&key, &meta, &frame);
+                            // Count the Kafka outcome for the VP -> FMS request
+                            // direction only, so the REST metrics are one per
+                            // transaction (matching the ISO 8583 request count)
+                            // regardless of publish_directions. Off the hot path.
+                            if dir == Direction::VpToFms {
+                                match published {
+                                    kafka::Published::Enqueued => {
+                                        Stats::inc(&self.stats.vp_kafka_req_ok)
+                                    }
+                                    kafka::Published::Failed => {
+                                        Stats::inc(&self.stats.vp_kafka_req_failed)
+                                    }
+                                    kafka::Published::Filtered => {}
+                                }
+                            }
                         }
                     }
                 }

@@ -151,9 +151,9 @@ fn prometheus(stats: &Stats) -> String {
 /// paths, so adding them changes no existing behaviour.
 ///
 ///   vp_reports_received_total  reports received from VP (VP -> FMS frames)
-///   vp_rest_requests_total     publish attempts to Kafka (enqueued + enqueue-failed)
-///   vp_rest_success_total      frames delivered to a broker
-///   vp_rest_failed_total       enqueue failures + delivery failures
+///   vp_rest_requests_total     VP->FMS request frames published to Kafka (one/txn)
+///   vp_rest_success_total      VP->FMS request frames enqueued to Kafka OK
+///   vp_rest_failed_total       VP->FMS request frames that failed to enqueue
 ///   vp_iso8583_requests_total  requests forwarded to FMS (= reports received)
 ///   vp_iso8583_success_total   FMS responses matched to a request
 ///   vp_iso8583_failed_total    requests that closed without a matching response
@@ -165,14 +165,16 @@ fn prometheus(stats: &Stats) -> String {
 fn perf_test_metrics(stats: &Stats, out: &mut String) {
     let reports = Stats::get(&stats.vp_reports_received);
 
-    let enqueued = Stats::get(&stats.kafka_enqueued);
-    let enqueue_failed = Stats::get(&stats.kafka_enqueue_failed);
-    let delivered = Stats::get(&stats.kafka_delivered);
-    let delivery_failed = Stats::get(&stats.kafka_delivery_failed);
+    // REST = Kafka leg, counted for VP->FMS request frames only (one per
+    // transaction), so it lines up with the VP / ISO 8583 request count even
+    // when publish_directions = "both". Broker-delivery health stays available
+    // separately via vp_interceptor_kafka_delivered / _delivery_failed.
+    let kreq_ok = Stats::get(&stats.vp_kafka_req_ok);
+    let kreq_failed = Stats::get(&stats.vp_kafka_req_failed);
 
-    let rest_requests = enqueued + enqueue_failed;
-    let rest_success = delivered;
-    let rest_failed = enqueue_failed + delivery_failed;
+    let rest_requests = kreq_ok + kreq_failed;
+    let rest_success = kreq_ok;
+    let rest_failed = kreq_failed;
 
     let iso_requests = reports;
     let iso_success = Stats::get(&stats.rtt_count);
@@ -186,17 +188,17 @@ fn perf_test_metrics(stats: &Stats, out: &mut String) {
         ),
         (
             "vp_rest_requests_total",
-            "Publish attempts to Kafka (enqueued + enqueue-failed)",
+            "VP->FMS request frames published to Kafka (one per transaction)",
             rest_requests,
         ),
         (
             "vp_rest_success_total",
-            "Frames delivered to a Kafka broker",
+            "VP->FMS request frames enqueued to Kafka OK",
             rest_success,
         ),
         (
             "vp_rest_failed_total",
-            "Kafka enqueue failures plus delivery failures",
+            "VP->FMS request frames that failed to enqueue to Kafka",
             rest_failed,
         ),
         (
