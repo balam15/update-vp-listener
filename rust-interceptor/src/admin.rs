@@ -143,7 +143,7 @@ fn prometheus(stats: &Stats) -> String {
 
 /// Performance-test (TPS) metrics, exposed with their literal public names (no
 /// `vp_interceptor_` prefix) so the load-test PromQL can reference them directly,
-/// e.g. `rate(vp_rest_success_total[1m])`.
+/// e.g. `rate(vp_kafka_success_total[1m])`.
 ///
 /// "rest" is the Kafka leg; "iso8583" is the FMS leg. All seven are monotonic
 /// counters. Only `vp_reports_received_total` is a dedicated counter; the others
@@ -151,12 +151,12 @@ fn prometheus(stats: &Stats) -> String {
 /// paths, so adding them changes no existing behaviour.
 ///
 ///   vp_reports_received_total  reports received from VP (VP -> FMS frames)
-///   vp_rest_requests_total     VP->FMS request frames published to Kafka (one/txn)
-///   vp_rest_success_total      VP->FMS request frames enqueued to Kafka OK
-///   vp_rest_failed_total       VP->FMS request frames that failed to enqueue
-///   vp_iso8583_requests_total  requests forwarded to FMS (= reports received)
-///   vp_iso8583_success_total   FMS responses matched to a request
-///   vp_iso8583_failed_total    requests that closed without a matching response
+///   vp_kafka_requests_total     VP->FMS request frames published to Kafka (one/txn)
+///   vp_kafka_success_total      VP->FMS request frames enqueued to Kafka OK
+///   vp_kafka_failed_total       VP->FMS request frames that failed to enqueue
+///   vp_fms_requests_total  requests forwarded to FMS (= reports received)
+///   vp_fms_success_total   FMS responses matched to a request
+///   vp_fms_failed_total    requests that closed without a matching response
 ///
 /// Note: the iso8583 success/failed split comes from the request/response
 /// pairing, so it requires `[timing] enabled = true` and `pair_request_response
@@ -187,32 +187,32 @@ fn perf_test_metrics(stats: &Stats, out: &mut String) {
             reports,
         ),
         (
-            "vp_rest_requests_total",
+            "vp_kafka_requests_total",
             "VP->FMS request frames published to Kafka (one per transaction)",
             rest_requests,
         ),
         (
-            "vp_rest_success_total",
+            "vp_kafka_success_total",
             "VP->FMS request frames enqueued to Kafka OK",
             rest_success,
         ),
         (
-            "vp_rest_failed_total",
+            "vp_kafka_failed_total",
             "VP->FMS request frames that failed to enqueue to Kafka",
             rest_failed,
         ),
         (
-            "vp_iso8583_requests_total",
+            "vp_fms_requests_total",
             "Requests forwarded to FMS (equals reports received from VP)",
             iso_requests,
         ),
         (
-            "vp_iso8583_success_total",
+            "vp_fms_success_total",
             "FMS responses matched to a forwarded request",
             iso_success,
         ),
         (
-            "vp_iso8583_failed_total",
+            "vp_fms_failed_total",
             "Requests that closed without a matching FMS response",
             iso_failed,
         ),
