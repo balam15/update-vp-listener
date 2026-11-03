@@ -1,0 +1,577 @@
+import groovy.transform.Field
+import java.text.SimpleDateFormat
+
+@Field String GLOBAL_MERGE = ""
+@Field String GLOBAL_TITLE = ""
+@Field String GLOBAL_TIME = ""
+@Field String GLOBAL_DESC_FILE = ""
+@Field List<String> GLOBAL_DEL = []
+@Field List<String> GLOBAL_COPY = []
+@Field List<String> SHELL_FILES = []
+@Field List<String> RUN_SHELL_FILES = []
+@Field List<String> PROC_FILES = []
+
+@Field boolean IS_COPIED_FILES_BACKED_UP = false
+@Field boolean IS_DELETED_FILES_BACKED_UP = false
+
+@Field String SSH_OPTS = "-o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+
+// Mapping normal -> bold unicode (single source of truth).
+@Field Map<String, String> BOLD_MAP = [
+    'A':'𝐀', 'B':'𝐁', 'C':'𝐂', 'D':'𝐃', 'E':'𝐄', 'F':'𝐅', 'G':'𝐆', 'H':'𝐇', 'I':'𝐈', 'J':'𝐉',
+    'K':'𝐊', 'L':'𝐋', 'M':'𝐌', 'N':'𝐍', 'O':'𝐎', 'P':'𝐏', 'Q':'𝐐', 'R':'𝐑', 'S':'𝐒', 'T':'𝐓',
+    'U':'𝐔', 'V':'𝐕', 'W':'𝐖', 'X':'𝐗', 'Y':'𝐘', 'Z':'𝐙',
+    'a':'𝐚', 'b':'𝐛', 'c':'𝐜', 'd':'𝐝', 'e':'𝐞', 'f':'𝐟', 'g':'𝐠', 'h':'𝐡', 'i':'𝐢', 'j':'𝐣',
+    'k':'𝐤', 'l':'𝐥', 'm':'𝐦', 'n':'𝐧', 'o':'𝐨', 'p':'𝐩', 'q':'𝐪', 'r':'𝐫', 's':'𝐬', 't':'𝐭',
+    'u':'𝐮', 'v':'𝐯', 'w':'𝐰', 'x':'𝐱', 'y':'𝐲', 'z':'𝐳',
+    '0':'𝟎', '1':'𝟏', '2':'𝟐', '3':'𝟑', '4':'𝟒', '5':'𝟓', '6':'𝟔', '7':'𝟕', '8':'𝟖', '9':'𝟗'
+]
+
+def toBold(String text) {
+    return text.collect { BOLD_MAP.get(it, it) }.join('')
+}
+
+def normalizeUnicode(String text) {
+    if (!text) return ""
+    String result = text
+    BOLD_MAP.each { normalChar, boldChar ->
+        result = result.replace(boldChar, normalChar)
+    }
+    return result
+}
+
+// Strip the leading "/" from each path.
+def stripLeadingSlash(List<String> files) {
+    return files.collect { it.replaceFirst('^/', '') }
+}
+
+// Render a space separated, quoted list of absolute remote paths.
+def remotePathArgs(List<String> relativeFiles) {
+    return relativeFiles.collect { "\"${REMOTE_DIR_SERVER}/$it\"" }.join(" ")
+}
+
+// Shared "Select All / pick items" input used by the copy, delete, run and
+// compile stages. Returns the list of selected items.
+def selectItems(List<String> items, String message) {
+    if (items.isEmpty()) {
+        return []
+    }
+
+    boolean isSingleItem = (items.size() == 1)
+    def paramList = []
+
+    if (items.size() > 1) {
+        paramList.add(
+            booleanParam(
+                name: 'Select All',
+                defaultValue: true,
+                description: toBold('SELECT ALL') + ' - Check this to process all items below.'
+            )
+        )
+    }
+
+    items.each { itemName ->
+        paramList.add(
+            booleanParam(
+                name: itemName,
+                defaultValue: isSingleItem,
+            )
+        )
+    }
+
+    def result = input message: message, ok: 'Proceed', parameters: paramList
+
+    if (result instanceof Map) {
+        boolean isSelectAll = (result.get('Select All') == true)
+        if (items.size() > 1 && isSelectAll) {
+            return items
+        }
+        return items.findAll { result.get(it) == true }
+    } else if (result instanceof Boolean) {
+        return result ? items : []
+    }
+
+    return []
+}
+
+pipeline {
+    agent { label 'docker-agent' }
+    parameters {
+        string(name: 'PR_ID', defaultValue: '0000', description: 'Input PR ID Azure.')
+        choice(
+            name: 'RUN_JOB',
+            choices: ['Full Execution', 'Run Job Pro*C Only'],
+            description: 'Select the execution mode.'
+        )
+    }
+    environment {
+        sshCredentials = "rdm-dss-ssh"
+        sshServer = "10.235.84.78"
+        sshUsername = "bmdev"
+        REMOTE_DIR_SERVER = "/export/home/${env.sshUsername}"
+        LOG = "JenkinsLog"
+    }
+    stages {
+        stage('🔍Deployment Preparation') {
+            when {
+                expression { params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                script {
+                    GLOBAL_DEL = []
+                    GLOBAL_COPY = []
+                    SHELL_FILES = []
+                    RUN_SHELL_FILES = []
+                    PROC_FILES = []
+
+                    IS_COPIED_FILES_BACKED_UP = false
+                    IS_DELETED_FILES_BACKED_UP = false
+
+                    def targetPrId = params.PR_ID
+
+                    def commitInfo = sh(
+                        script: "git log origin/main -n 100 --pretty=format:'%H|%s|%ci' | grep -E '^[^|]*\\|[[:space:]]*(Merged[[:space:]]+)?PR[[:space:]]*${params.PR_ID}:' | head -n 1",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!commitInfo) {
+                        error("❌ Commit/PR ID not found for PR ID: ${targetPrId}")
+                    }
+
+                    def parts = commitInfo.split('\\|')
+                    GLOBAL_MERGE = parts[0]
+                    GLOBAL_TITLE = parts[1]
+                    GLOBAL_TIME = parts[2]
+
+                    def diffOutput = sh(
+                        script: "git diff --name-status ${GLOBAL_MERGE}^1 ${GLOBAL_MERGE}",
+                        returnStdout: true
+                    ).trim()
+
+                    if (diffOutput) {
+                        diffOutput.split('\n').each { line ->
+                            if (line.trim()) {
+                                parts = line.split('\t')
+                                def action = parts[0]
+
+                                if (action.startsWith('R')) {
+                                    GLOBAL_DEL.add("/" + parts[1])
+                                    GLOBAL_COPY.add("/" + parts[2])
+                                } else {
+                                    def filePath = "/" + parts[1]
+                                    switch (action) {
+                                        case 'D': GLOBAL_DEL.add(filePath); break
+                                        case 'A':
+                                        case 'M': GLOBAL_COPY.add(filePath); break
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    GLOBAL_COPY.each { file ->
+                        if (file.endsWith('.sh')) {
+                            SHELL_FILES.add(file)
+                            if (file.startsWith('/run_make_inc/')) {
+                                RUN_SHELL_FILES.add(file)
+                            }
+                        }
+
+                        if (file.endsWith('.pc')) {
+                            PROC_FILES.add(file)
+                        }
+                    }
+
+                    GLOBAL_DESC_FILE = (GLOBAL_DEL.isEmpty() ? "" : "\n\nList ️Remove Files:\n- ${GLOBAL_DEL.join('\n- ')}") + (GLOBAL_COPY.isEmpty() ? "" : "\n\nList Send Files:\n- ${GLOBAL_COPY.join('\n- ')}")
+                }
+            }
+        }
+        stage('⚠️PR Verification❓') {
+            when {
+                expression { params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                script {
+                    input(
+                        message: "Are you sure you want to deploy ${GLOBAL_TITLE} to ${sshUsername}?" + GLOBAL_DESC_FILE,
+                        ok: 'Yes'
+                    )
+                }
+            }
+        }
+        stage('🚀Send files to server❓') {
+            when {
+                expression { !GLOBAL_COPY.isEmpty() && params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                script {
+                    GLOBAL_COPY = selectItems(GLOBAL_COPY, "Please select items to process to send to ${sshUsername}:")
+
+                    if (GLOBAL_COPY.isEmpty()) {
+                        echo "Send files to server skipped due to user cancellation."
+                    } else {
+                        IS_COPIED_FILES_BACKED_UP = true
+                    }
+                }
+            }
+        }
+        stage('💾Backup files') {
+            when {
+                expression { IS_COPIED_FILES_BACKED_UP && params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    script {
+                        try {
+                            sh """
+                                ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                    echo "rm -rf ${REMOTE_DIR_SERVER}/run_make_inc || true"
+                                    rm -rf ${REMOTE_DIR_SERVER}/run_make_inc || true
+                                '
+                            """
+
+                            for (file in GLOBAL_COPY) {
+                                def relativeFile = file.replaceFirst("^/", "")
+
+                                def parts = relativeFile.tokenize('/')
+                                if (parts.size() < 2) {
+                                    echo "Skip backup for root file: ${file}"
+                                    continue
+                                }
+
+                                def mainDirectory = parts.remove(0)
+                                if (mainDirectory == "run_make_inc") {
+                                    echo "Skip backup for run_make_inc file: ${file}"
+                                    continue
+                                }
+
+                                def backupFile = mainDirectory + "/backup/" + parts.join('/') + "_" + new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date())
+
+                                echo "Backup ${relativeFile} -> ${backupFile}"
+
+                                sh """
+                                    ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                        if [ -f ${REMOTE_DIR_SERVER}/${relativeFile} ]; then
+                                            mkdir -p ${REMOTE_DIR_SERVER}/\$(dirname ${backupFile}) || true
+                                            cp ${REMOTE_DIR_SERVER}/${relativeFile} ${REMOTE_DIR_SERVER}/${backupFile} || true
+                                        fi
+                                    '
+                                """
+                            }
+                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                            echo "Backup files skipped due to user cancellation."
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        stage('📥Copy files to server') {
+            when {
+                expression { IS_COPIED_FILES_BACKED_UP && params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    script {
+                        try {
+                            for (file in GLOBAL_COPY) {
+                                def relativeFile = file.replaceFirst("^/", "")
+                                echo "Copy ${REMOTE_DIR_SERVER}/${relativeFile}"
+                                sh """
+                                    rsync -avz \
+                                        -e "ssh ${SSH_OPTS}" \
+                                        --rsync-path="mkdir -p \$(dirname ${REMOTE_DIR_SERVER}/${relativeFile}) && rsync" \
+                                        ${WORKSPACE}/${relativeFile} \
+                                        ${sshUsername}@${sshServer}:${REMOTE_DIR_SERVER}/${relativeFile}
+                                """
+                            }
+
+                            def dos2unixFiles = stripLeadingSlash(GLOBAL_COPY)
+                            sh """
+                                ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                    . .bash_profile
+                                    for file in ${remotePathArgs(dos2unixFiles)}; do
+                                        echo "dos2unix \$file \$file"
+                                        dos2unix "\$file" "\$file"
+                                    done
+                                '
+                            """
+                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                            echo "Copy files skipped due to user cancellation."
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        stage('🛠️Chmod shell script files') {
+            when {
+                expression { IS_COPIED_FILES_BACKED_UP && params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    script {
+                        try {
+                            def filesToExecute = SHELL_FILES.findAll { item -> GLOBAL_COPY.contains(item) }
+                            def shFiles = stripLeadingSlash(filesToExecute)
+                            if (shFiles.isEmpty()) {
+                                echo "No .sh files to process in the copied files list. Skipping chmod."
+                                return
+                            }
+
+                            sh """
+                                ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                    for file in ${remotePathArgs(shFiles)}; do
+                                        echo "Update permissions for \$file"
+                                        echo "chmod 755 \$file"
+                                        chmod 755 "\$file"
+                                    done
+                                '
+                            """
+                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                            echo "Chmod shell script files skipped due to user cancellation."
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        stage('🗑️Remove files from server❓') {
+            when {
+                expression { !GLOBAL_DEL.isEmpty() && params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    script {
+                        GLOBAL_DEL = selectItems(GLOBAL_DEL, "Please select items to process and remove from ${sshUsername}:")
+
+                        if (GLOBAL_DEL.isEmpty()) {
+                            echo "Remove files from server skipped due to user cancellation."
+                        } else {
+                            for (file in GLOBAL_DEL) {
+                                echo "Delete ${file}"
+                                sh """
+                                    ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                        echo "Delete \$REMOTE_DIR_SERVER\$file"
+                                        echo "rm -rf \$REMOTE_DIR_SERVER\$file || true"
+                                        rm -rf ${REMOTE_DIR_SERVER}${file} || true
+                                    '
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('🚀Execute script make_inc in /run_make_inc folder❓') {
+            when {
+                expression { !RUN_SHELL_FILES.isEmpty() && params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    script {
+                        RUN_SHELL_FILES = selectItems(RUN_SHELL_FILES, "Please select shell scripts to execute in the /run_make_inc folder on ${sshUsername}:")
+
+                        def runShFiles = stripLeadingSlash(RUN_SHELL_FILES)
+
+                        sh """
+                            echo "cd ${REMOTE_DIR_SERVER}/include"
+                        """
+
+                        if (runShFiles.isEmpty()) {
+                            echo "Execute shells script in /run_make_inc folder skipped due to user cancellation."
+                        } else {
+                            sh """
+                                ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                    . .bash_profile
+                                    echo "cd ${REMOTE_DIR_SERVER}/include"
+                                    cd "${REMOTE_DIR_SERVER}/include" || exit 1
+                                    for file in ${remotePathArgs(runShFiles)}; do
+                                        echo "sh \$file"
+                                        sh "\$file"
+                                    done
+                                '
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        stage('🛠️Compile ProC❓') {
+            when {
+                expression { !PROC_FILES.isEmpty() && params.RUN_JOB != 'Run Job Pro*C Only' }
+            }
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    script {
+                        PROC_FILES = selectItems(PROC_FILES, "Please select Pro*C files to compile on ${sshUsername}:")
+
+                        def CompilePCFiles = stripLeadingSlash(PROC_FILES)
+
+                        if (CompilePCFiles.isEmpty()) {
+                            echo "Compile ProC skipped due to user cancellation."
+                        } else {
+                            sh """
+                                ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                    . .bash_profile
+                                    for file in ${remotePathArgs(CompilePCFiles)}; do
+                                        echo "cd \$(dirname "\$file")"
+                                        cd "\$(dirname "\$file")" || exit 1
+                                        echo "pcl \$(basename "\$file")"
+                                        pcl "\$(basename "\$file")"
+                                    done
+                                '
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        stage('🚀Run Job Pro*C Only❓') {
+            steps {
+                sshagent(credentials: [env.sshCredentials]) {
+                    script {
+                        def code = "first"
+
+                        while (code != "") {
+                            def userInputText = input(
+                                id: 'runjob',
+                                message: 'Please enter the shell command or script to run the job:',
+                                ok: 'Proceed',
+                                parameters: [
+                                    text(
+                                        name: 'runjob_script',
+                                        defaultValue: '',
+                                        description: 'Enter script here'
+                                    )
+                                ]
+                            )
+
+                            echo userInputText
+                            code = userInputText
+
+                            if (code != "") {
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                    sh """
+                                        ssh ${SSH_OPTS} ${sshUsername}@${sshServer} '
+                                            . .bash_profile
+                                            cd ${REMOTE_DIR_SERVER}/src
+                                            ${code}
+                                        '
+                                    """
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        failure {
+            echo 'Pipeline failed. Please check the console output for details.'
+        }
+        unstable {
+            echo 'Pipeline is unstable. Some tests might have failed.'
+        }
+        always {
+            script {
+                def originUrl = scm.userRemoteConfigs[0].url
+                def repoName = originUrl.tokenize('/')[-1].replace('.git', '')
+
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    withCredentials([usernamePassword(
+                        credentialsId: scm.userRemoteConfigs[0].credentialsId,
+                        usernameVariable: 'GIT_USER',
+                        passwordVariable: 'GIT_PASSWORD'
+                    )]) {
+                        try {
+                            GLOBAL_TITLE = normalizeUnicode(GLOBAL_TITLE)
+
+                            def rawTitle = GLOBAL_TITLE ?: ""
+                            if (rawTitle.contains(":")) {
+                                rawTitle = rawTitle.tokenize(":").last().trim()
+                            }
+
+                            rawTitle = rawTitle.replaceAll(/(?i)([Ff][Aa][Ll][Ll][Bb][Aa][Cc][Kk]).*$/, "").trim()
+                            rawTitle = rawTitle.replaceAll(/_$/, "").trim()
+                            rawTitle = rawTitle.replaceAll(/\[[EePpTt]\]/, "").trim()
+
+                            sh """
+                                set -e
+
+                                rm -rf .git_log_tmp
+                                mkdir -p .git_log_tmp
+                                cd .git_log_tmp
+
+                                FILE_NAME="${repoName}.json"
+
+                                ENCODED_USER=\$(echo -n "\$GIT_USER" | sed 's/@/%40/g')
+                                ORIGIN_URL=\$(git -C .. remote get-url origin | sed 's|https://||' | sed 's|mbid@dev.azure.com|dev.azure.com|g')
+                                ORIGIN_URL=\$(echo "\$ORIGIN_URL" | sed "s|${repoName}|${env.LOG}|g")
+
+                                TARGET_URL="https://\${ENCODED_USER}:\${GIT_PASSWORD}@\${ORIGIN_URL}"
+
+                                git clone "\$TARGET_URL" .
+
+                                MAIN_BRANCH=\$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
+                                echo "=== Main branch detected: \$MAIN_BRANCH ==="
+                                git checkout \$MAIN_BRANCH || git checkout -b \$MAIN_BRANCH origin/\$MAIN_BRANCH
+
+                                if [ ! -f "\$FILE_NAME" ]; then
+                                    echo "[]" > "\$FILE_NAME"
+                                fi
+
+                                GLOBAL_MERGE_ID="${GLOBAL_MERGE}"
+                                GLOBAL_TITLE="${GLOBAL_TITLE}"
+                                GLOBAL_TIME="${GLOBAL_TIME}"
+                                ORI_TITLE="${rawTitle}"
+
+                                if [[ -n "\$GLOBAL_TITLE" ]]; then
+                                    EXISTS=\$(jq --arg title "\$GLOBAL_TITLE" '[.[] | select(.title == \$title)] | length' "\$FILE_NAME")
+
+                                    if [ "\$EXISTS" -gt 0 ]; then
+                                        echo "=== Title '\$GLOBAL_TITLE' already exists in \$FILE_NAME. Skipping. ==="
+                                    else
+                                        echo "=== Title does not exist. Adding mergeId, title, and time to \$FILE_NAME... ==="
+                                        jq --arg mergeId "\$GLOBAL_MERGE_ID" --arg title "\$GLOBAL_TITLE" --arg time "\$GLOBAL_TIME" --arg title_ori "\$ORI_TITLE" '. + [{"mergeId": \$mergeId, "title": \$title, "time": \$time, "title_ori": \$title_ori}]' "\$FILE_NAME" > "\$FILE_NAME.tmp" && mv "\$FILE_NAME.tmp" "\$FILE_NAME"
+                                        git add "\$FILE_NAME"
+                                    fi
+                                else
+                                    echo "=== GLOBAL_TITLE is empty. Skipping file entry update. ==="
+                                fi
+
+                                if ! git diff --cached --quiet; then
+                                    COMMIT_NAME=\$(echo "\$GIT_USER" | cut -d'@' -f1)
+                                    echo "=== Committing JSON data file cleanly... ==="
+                                    git commit --author="\$COMMIT_NAME <\$GIT_USER>" -m "update data for PR #${params.PR_ID}"
+
+                                    echo "=== Syncing with remote repository changes via rebase... ==="
+                                    git pull --rebase "\$TARGET_URL" \$MAIN_BRANCH
+
+                                    echo "=== Pushing sanitized archive payload to Azure DevOps... ==="
+                                    git push "\$TARGET_URL" \$MAIN_BRANCH
+                                else
+                                    echo "=== No changes detected. Nothing to commit or push. ==="
+                                fi
+
+                                cd ..
+                                rm -rf .git_log_tmp
+                            """
+                        } catch (Exception e) {
+                            echo "=== [ERROR] Pipeline failed during Git synchronization ==="
+                            echo "Error Details: " + e.toString()
+                            sh "rm -rf .git_log_tmp || true"
+                            error "Terminating build due to Git operation failure."
+                        }
+                    }
+                }
+            }
+
+            cleanWs() // Clean up the workspace after the pipeline completes
+        }
+    }
+}
