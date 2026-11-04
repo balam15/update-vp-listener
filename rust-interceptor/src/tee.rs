@@ -546,6 +546,11 @@ impl Worker {
                             if dir == Direction::VpToFms {
                                 Stats::inc(&self.stats.vp_reports_received);
                             }
+                            // Success criterion: one per FMS -> VP response frame
+                            // forwarded back to VP. No pairing, no pending queue.
+                            if dir == Direction::FmsToVp {
+                                Stats::inc(&self.stats.vp_fms_responses);
+                            }
 
                             // Timing is measured per frame, not per chunk, so a
                             // pipelined read yields one measurement per message.

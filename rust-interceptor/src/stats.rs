@@ -145,6 +145,14 @@ pub struct Stats {
     /// Frames dropped by [kafka.filter] (echo/sign-on) are counted in neither.
     pub vp_kafka_req_ok: AtomicU64,
     pub vp_kafka_req_failed: AtomicU64,
+
+    /// Responses FMS sent back, i.e. one per FMS -> VP frame reassembled on the
+    /// tee side. This is the success criterion: a request to FMS counts as a
+    /// success when FMS replies and that reply is forwarded to VP. It is counted
+    /// purely per response frame -- NO request/response pairing, NO pending
+    /// queue -- so it never depends on responses arriving in order and never
+    /// gates any other packet. Incremented on a tee worker, off the hot path.
+    pub vp_fms_responses: AtomicU64,
 }
 
 /// Metrics that go up and down. Everything else in `snapshot()` is a counter.

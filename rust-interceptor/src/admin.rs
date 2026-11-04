@@ -154,14 +154,14 @@ fn prometheus(stats: &Stats) -> String {
 ///   vp_kafka_requests_total     VP->FMS request frames published to Kafka (one/txn)
 ///   vp_kafka_success_total      VP->FMS request frames enqueued to Kafka OK
 ///   vp_kafka_failed_total       VP->FMS request frames that failed to enqueue
-///   vp_fms_requests_total  requests forwarded to FMS (= reports received)
-///   vp_fms_success_total   FMS responses matched to a request
-///   vp_fms_failed_total    requests that closed without a matching response
+///   vp_fms_requests_total  reports forwarded to FMS (VP -> FMS frames)
+///   vp_fms_success_total   responses FMS sent back to VP (FMS -> VP frames)
+///   vp_fms_no_response     GAUGE: requests with no response yet (requests - responses)
 ///
-/// Note: the iso8583 success/failed split comes from the request/response
-/// pairing, so it requires `[timing] enabled = true` and `pair_request_response
-/// = true` (both on by default). With timing off, requests still counts but
-/// success/failed stay at 0.
+/// Success here means "FMS replied and that reply was forwarded to VP" -- it is
+/// counted per FMS -> VP response frame, with NO request/response pairing and NO
+/// pending queue, so it does not assume responses arrive in order and never gates
+/// any other packet. "No response" is simply requests minus responses.
 fn perf_test_metrics(stats: &Stats, out: &mut String) {
     let reports = Stats::get(&stats.vp_reports_received);
 
@@ -176,49 +176,58 @@ fn perf_test_metrics(stats: &Stats, out: &mut String) {
     let rest_success = kreq_ok;
     let rest_failed = kreq_failed;
 
-    let iso_requests = reports;
-    let iso_success = Stats::get(&stats.rtt_count);
-    let iso_failed = Stats::get(&stats.rtt_unmatched);
+    // FMS leg. Success = a response from FMS was forwarded back to VP (one per
+    // FMS->VP frame). No pairing/pending; robust to out-of-order responses.
+    let fms_requests = reports;
+    let fms_success = Stats::get(&stats.vp_fms_responses);
+    let fms_no_response = fms_requests.saturating_sub(fms_success);
 
-    for (name, help, value) in [
+    for (name, kind, help, value) in [
         (
             "vp_reports_received_total",
+            "counter",
             "Reports received from VP (one per VP->FMS frame reassembled)",
             reports,
         ),
         (
             "vp_kafka_requests_total",
+            "counter",
             "VP->FMS request frames published to Kafka (one per transaction)",
             rest_requests,
         ),
         (
             "vp_kafka_success_total",
+            "counter",
             "VP->FMS request frames enqueued to Kafka OK",
             rest_success,
         ),
         (
             "vp_kafka_failed_total",
+            "counter",
             "VP->FMS request frames that failed to enqueue to Kafka",
             rest_failed,
         ),
         (
             "vp_fms_requests_total",
-            "Requests forwarded to FMS (equals reports received from VP)",
-            iso_requests,
+            "counter",
+            "Reports forwarded to FMS (VP->FMS frames)",
+            fms_requests,
         ),
         (
             "vp_fms_success_total",
-            "FMS responses matched to a forwarded request",
-            iso_success,
+            "counter",
+            "Responses FMS sent back to VP (FMS->VP frames); success = reply received, no pairing",
+            fms_success,
         ),
         (
-            "vp_fms_failed_total",
-            "Requests that closed without a matching FMS response",
-            iso_failed,
+            "vp_fms_no_response",
+            "gauge",
+            "Requests to FMS with no response yet (requests - responses)",
+            fms_no_response,
         ),
     ] {
         out.push_str(&format!("# HELP {name} {help}\n"));
-        out.push_str(&format!("# TYPE {name} counter\n"));
+        out.push_str(&format!("# TYPE {name} {kind}\n"));
         out.push_str(&format!("{name} {value}\n"));
     }
 }
