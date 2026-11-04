@@ -154,14 +154,16 @@ fn prometheus(stats: &Stats) -> String {
 ///   vp_kafka_requests_total     VP->FMS request frames published to Kafka (one/txn)
 ///   vp_kafka_success_total      VP->FMS request frames enqueued to Kafka OK
 ///   vp_kafka_failed_total       VP->FMS request frames that failed to enqueue
-///   vp_fms_requests_total  reports forwarded to FMS (VP -> FMS frames)
-///   vp_fms_success_total   responses FMS sent back to VP (FMS -> VP frames)
-///   vp_fms_no_response     GAUGE: requests with no response yet (requests - responses)
+///   vp_fms_requests_total   reports forwarded to FMS (VP -> FMS frames)
+///   vp_fms_success_total    success by request/response pairing (rtt match) -- UNCHANGED
+///   vp_fms_failed_total     requests with no matching response, pairing -- UNCHANGED
+///   vp_fms_responses_total  responses FMS sent back to VP (FMS -> VP frames) -- NEW
 ///
-/// Success here means "FMS replied and that reply was forwarded to VP" -- it is
-/// counted per FMS -> VP response frame, with NO request/response pairing and NO
-/// pending queue, so it does not assume responses arrive in order and never gates
-/// any other packet. "No response" is simply requests minus responses.
+/// The pairing-based success/failed (rtt_count / rtt_unmatched) are kept exactly
+/// as before. `vp_fms_responses_total` is an ADDITIONAL, pairing-free success
+/// signal: one per FMS -> VP response frame, with NO request/response pairing and
+/// NO pending queue, so it does not assume responses arrive in order and never
+/// gates any other packet. Use whichever success definition you prefer.
 fn perf_test_metrics(stats: &Stats, out: &mut String) {
     let reports = Stats::get(&stats.vp_reports_received);
 
@@ -176,58 +178,57 @@ fn perf_test_metrics(stats: &Stats, out: &mut String) {
     let rest_success = kreq_ok;
     let rest_failed = kreq_failed;
 
-    // FMS leg. Success = a response from FMS was forwarded back to VP (one per
-    // FMS->VP frame). No pairing/pending; robust to out-of-order responses.
+    // FMS leg. success/failed keep their original pairing-based meaning;
+    // vp_fms_responses_total is the new pairing-free "reply received" count.
     let fms_requests = reports;
-    let fms_success = Stats::get(&stats.vp_fms_responses);
-    let fms_no_response = fms_requests.saturating_sub(fms_success);
+    let fms_success = Stats::get(&stats.rtt_count);
+    let fms_failed = Stats::get(&stats.rtt_unmatched);
+    let fms_responses = Stats::get(&stats.vp_fms_responses);
 
-    for (name, kind, help, value) in [
+    for (name, help, value) in [
         (
             "vp_reports_received_total",
-            "counter",
             "Reports received from VP (one per VP->FMS frame reassembled)",
             reports,
         ),
         (
             "vp_kafka_requests_total",
-            "counter",
             "VP->FMS request frames published to Kafka (one per transaction)",
             rest_requests,
         ),
         (
             "vp_kafka_success_total",
-            "counter",
             "VP->FMS request frames enqueued to Kafka OK",
             rest_success,
         ),
         (
             "vp_kafka_failed_total",
-            "counter",
             "VP->FMS request frames that failed to enqueue to Kafka",
             rest_failed,
         ),
         (
             "vp_fms_requests_total",
-            "counter",
             "Reports forwarded to FMS (VP->FMS frames)",
             fms_requests,
         ),
         (
             "vp_fms_success_total",
-            "counter",
-            "Responses FMS sent back to VP (FMS->VP frames); success = reply received, no pairing",
+            "FMS responses matched to a request (request/response pairing)",
             fms_success,
         ),
         (
-            "vp_fms_no_response",
-            "gauge",
-            "Requests to FMS with no response yet (requests - responses)",
-            fms_no_response,
+            "vp_fms_failed_total",
+            "Requests that closed without a matching FMS response (pairing)",
+            fms_failed,
+        ),
+        (
+            "vp_fms_responses_total",
+            "Responses FMS sent back to VP (FMS->VP frames); pairing-free success signal",
+            fms_responses,
         ),
     ] {
         out.push_str(&format!("# HELP {name} {help}\n"));
-        out.push_str(&format!("# TYPE {name} {kind}\n"));
+        out.push_str(&format!("# TYPE {name} counter\n"));
         out.push_str(&format!("{name} {value}\n"));
     }
 }
